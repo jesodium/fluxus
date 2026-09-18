@@ -3,16 +3,67 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 const PORT_CONFIG: &str = "default_port_config:";
+const SKIP: [&str; 4] = ["node_modules", "target", "build", "dist"];
 
 // -- discovery --
 
-pub fn find(path: &Path) -> Result<PathBuf> {
-    let p = path.canonicalize().with_context(|| format!("{} not found", path.display()))?;
-    let dir = if p.is_file() { p.parent().context("sketch has no parent folder")?.to_path_buf() } else { p };
-    let name = dir.file_name().context("sketch folder has no name")?.to_string_lossy();
-    if !dir.join(format!("{name}.ino")).is_file() {
-        bail!("no sketch: {} has no {name}.ino", dir.display());
+fn is_sketch(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| dir.join(format!("{}.ino", n.to_string_lossy())).is_file())
+}
+
+pub fn scan(root: &Path) -> Vec<String> {
+    let mut out = vec![];
+    walk(root, root, 0, &mut out);
+    out.sort_by_key(|s| s.to_lowercase());
+    out
+}
+
+fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth > 8 {
+        return;
     }
+    if is_sketch(dir) {
+        let rel = dir.strip_prefix(root).unwrap_or(dir).to_string_lossy().into_owned();
+        out.push(if rel.is_empty() { ".".into() } else { rel });
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+            continue;
+        }
+        let path = e.path();
+        if path.is_dir() {
+            walk(root, &path, depth + 1, out);
+        } else if name.ends_with(".ino") {
+            out.push(path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned());
+        }
+    }
+}
+
+pub fn folder(root: &Path, rel: &str) -> Option<PathBuf> {
+    (!rel.ends_with(".ino")).then(|| root.join(rel))
+}
+
+pub fn scratch() -> PathBuf {
+    let tmp = std::env::temp_dir();
+    tmp.canonicalize().unwrap_or(tmp).join("fluxus")
+}
+
+pub fn build_dir(root: &Path, rel: &str) -> Result<PathBuf> {
+    if let Some(dir) = folder(root, rel) {
+        if !is_sketch(&dir) {
+            bail!("{rel} is no longer a sketch");
+        }
+        return Ok(dir);
+    }
+    // stray .ino, arduino-cli wants it in a folder of the same name
+    let src = root.join(rel);
+    let stem = src.file_stem().context("bad sketch path")?.to_string_lossy().into_owned();
+    let dir = scratch().join(&stem);
+    std::fs::create_dir_all(&dir).context("making scratch sketch folder")?;
+    std::fs::copy(&src, dir.join(format!("{stem}.ino"))).with_context(|| format!("copying {rel}"))?;
     Ok(dir)
 }
 
@@ -33,6 +84,13 @@ pub fn save_baud(dir: &Path, baud: u32) -> Result<()> {
         return Ok(());
     }
     std::fs::write(&path, set_baud(&yaml, baud)?).context("writing sketch.yaml")
+}
+
+pub fn yaml_value(dir: &Path, key: &str) -> Option<String> {
+    let yaml = std::fs::read_to_string(dir.join("sketch.yaml")).ok()?;
+    let v = yaml.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))?;
+    let v = v.split('#').next()?.trim().trim_matches(['"', '\'']);
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 fn top_level(line: &str) -> bool {
@@ -78,19 +136,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finds_sketch_by_folder_or_ino() {
-        let root = std::env::temp_dir().join(format!("fluxus-test-{}", std::process::id()));
-        let dir = root.join("Blink");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Blink.ino"), "").unwrap();
-        std::fs::write(dir.join("Other.ino"), "").unwrap();
-        let want = dir.canonicalize().unwrap();
+    fn scans_a_repo_like_blackout() {
+        let root = std::env::temp_dir().join(format!("fluxus-scan-{}", std::process::id()));
+        for (dir, ino) in [
+            ("giga-r1/main", "main.ino"),
+            ("giga-r1/main", "extra_tab.ino"),
+            ("giga-r1/i2c_scan", "i2c_scan.ino"),
+            ("scratchpad", "motor_test.ino"),
+            ("server/node_modules/x", "x.ino"),
+            (".git/y", "y.ino"),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join(ino), "").unwrap();
+        }
+        std::fs::create_dir_all(root.join("OUTDATED/old")).unwrap();
+        std::fs::write(root.join("OUTDATED/old/old.ino"), "").unwrap();
+        assert_eq!(scan(&root), ["giga-r1/i2c_scan", "giga-r1/main", "OUTDATED/old", "scratchpad/motor_test.ino"]);
+        std::fs::write(root.join("giga-r1/main/sketch.yaml"), "default_fqbn: a:b:c\ndefault_port: /dev/cu.usbmodem1101 # giga\n").unwrap();
+        assert_eq!(yaml_value(&root.join("giga-r1/main"), "default_port").as_deref(), Some("/dev/cu.usbmodem1101"));
+        assert_eq!(scan(&root.join("giga-r1/main")), ["."]);
 
-        assert_eq!(find(&dir).unwrap(), want);
-        assert_eq!(find(&dir.join("Blink.ino")).unwrap(), want);
-        assert_eq!(find(&dir.join("Other.ino")).unwrap(), want);
-        assert!(find(&root).is_err());
-        assert!(find(&root.join("missing")).is_err());
+        let built = build_dir(&root, "scratchpad/motor_test.ino").unwrap();
+        assert!(built.join("motor_test.ino").is_file());
+        assert_eq!(build_dir(&root, "giga-r1/main").unwrap(), root.join("giga-r1/main"));
+        assert!(build_dir(&root, "scratchpad").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

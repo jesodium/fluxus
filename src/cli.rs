@@ -25,7 +25,7 @@ pub struct Board {
     pub fqbn: String,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct Port {
     pub address: String,
     #[serde(default)]

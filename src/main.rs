@@ -1,12 +1,13 @@
 mod app;
 mod cli;
+mod project;
 mod sketch;
 mod ui;
 
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
@@ -20,17 +21,16 @@ const PORT_POLL: Duration = Duration::from_secs(2);
 async fn main() -> Result<()> {
     let arg = std::env::args().nth(1);
     if matches!(arg.as_deref(), Some("-h" | "--help")) {
-        println!("usage: fluxus [SKETCH]\n\nSKETCH is a sketch folder or its .ino file (default: current directory).");
+        println!("usage: fluxus [DIR]\n\nDIR is a project folder or a single sketch (default: current directory).");
         return Ok(());
     }
-    let sketch = match &arg {
-        Some(a) => Ok(sketch::find(Path::new(a))?),
-        None => sketch::find(Path::new(".")).map_err(|e| format!("{e:#}")),
-    };
+    let path = Path::new(arg.as_deref().unwrap_or("."));
+    let root = path.canonicalize().with_context(|| format!("{} not found", path.display()))?;
+    let root = if root.is_file() { root.parent().context("no parent folder")?.to_path_buf() } else { root };
     let cli_version = cli::check_version().await?;
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut app = App::new(cli_version, sketch, tx.clone());
+    let mut app = App::new(cli_version, root, tx.clone());
 
     // -- background --
 
@@ -44,8 +44,8 @@ async fn main() -> Result<()> {
             tokio::time::sleep(PORT_POLL).await;
         }
     });
-    if let Ok(dir) = app.sketch.clone() {
-        let tx = tx.clone();
+    if app.wants_defaults() {
+        let (tx, dir) = (tx.clone(), app.root.clone());
         tokio::spawn(async move {
             if let Ok(d) = cli::attached(&dir).await {
                 let _ = tx.send(AppEvent::Defaults(d));

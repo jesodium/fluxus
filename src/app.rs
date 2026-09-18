@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -7,6 +8,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::cli::{self, Attached, Board, Detected, Port};
+use crate::project::{self, Target};
 use crate::sketch;
 
 pub const BAUDS: [u32; 15] = [
@@ -28,28 +30,38 @@ pub enum AppEvent {
 pub enum Tab {
     Build,
     Monitor,
-    Boards,
+    Project,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Build, Tab::Monitor, Tab::Boards];
+    pub const ALL: [Tab; 3] = [Tab::Build, Tab::Monitor, Tab::Project];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Build => "Build",
             Tab::Monitor => "Monitor",
-            Tab::Boards => "Boards",
+            Tab::Project => "Project",
         }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    AddBoard,
+    Board,
+    Sketch,
+    Port,
+}
+
 pub struct Picker {
+    pub kind: Pick,
+    pub target: usize,
     pub query: String,
     pub sel: usize,
 }
 
 pub struct Job {
-    pub name: &'static str,
+    pub name: String,
     started: Instant,
     handle: JoinHandle<()>,
 }
@@ -63,21 +75,27 @@ pub struct Monitor {
 pub struct App {
     tx: UnboundedSender<AppEvent>,
     pub cli_version: String,
-    pub sketch: Result<PathBuf, String>,
+    pub root: PathBuf,
+    root_is_sketch: bool,
+    pub project_err: Option<String>,
     pub tab: Tab,
 
+    pub boards: Vec<Target>,
+    pub sketches: Vec<String>,
+    sketch_fqbn: HashMap<String, String>,
+    pending_port: Option<String>,
+    pub active: usize,
+    pub sel: usize,
     pub ports: Vec<Detected>,
     pub ports_err: Option<String>,
     pub scanned: bool,
-    pub sel: usize,
-    pub port: Option<Port>,
-    pub board: Option<Board>,
     pub all_boards: Option<Result<Vec<Board>, String>>,
     pub picker: Option<Picker>,
 
     pub log: Vec<String>,
     pub log_scroll: usize,
     pub job: Option<Job>,
+    queue: VecDeque<usize>,
 
     pub serial: Vec<String>,
     pub serial_scroll: usize,
@@ -91,33 +109,53 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cli_version: String, sketch: Result<PathBuf, String>, tx: UnboundedSender<AppEvent>) -> Self {
-        let baud = sketch.as_ref().ok().and_then(|d| sketch::load_baud(d)).unwrap_or(9600);
-        Self {
+    pub fn new(cli_version: String, root: PathBuf, tx: UnboundedSender<AppEvent>) -> Self {
+        let (boards, project_err) = match project::load(&root) {
+            Ok(b) => (b, None),
+            Err(e) => (vec![], Some(format!("{e:#}"))),
+        };
+        let sketches = sketch::scan(&root);
+        let sketch_fqbn = sketches
+            .iter()
+            .filter_map(|s| Some((s.clone(), sketch::yaml_value(&sketch::folder(&root, s)?, "default_fqbn")?)))
+            .collect();
+        let mut app = Self {
             tx,
             cli_version,
-            sketch,
-            tab: Tab::Boards,
+            root_is_sketch: sketches == ["."],
+            root,
+            project_err,
+            tab: if boards.is_empty() { Tab::Project } else { Tab::Build },
+            boards,
+            sketches,
+            sketch_fqbn,
+            pending_port: None,
+            active: 0,
+            sel: 0,
             ports: vec![],
             ports_err: None,
             scanned: false,
-            sel: 0,
-            port: None,
-            board: None,
             all_boards: None,
             picker: None,
             log: vec![],
             log_scroll: 0,
             job: None,
+            queue: VecDeque::new(),
             serial: vec![],
             serial_scroll: 0,
-            baud,
+            baud: 9600,
             monitor: None,
             mon_gen: 0,
             resume_monitor: false,
             input: None,
             quit: false,
-        }
+        };
+        app.load_baud();
+        app
+    }
+
+    pub fn wants_defaults(&self) -> bool {
+        self.root_is_sketch && self.boards.is_empty()
     }
 
     // -- events --
@@ -129,31 +167,32 @@ impl App {
                 self.ports = p;
                 self.ports_err = None;
                 self.scanned = true;
-                self.sel = self.sel.min(self.ports.len().saturating_sub(1));
             }
             AppEvent::Ports(Err(e)) => self.ports_err = Some(e),
             AppEvent::AllBoards(r) => {
                 self.all_boards = Some(r);
-                if let Some(b) = &self.board {
-                    let name = self.board_name(&b.fqbn);
-                    self.board.as_mut().expect("checked").name = name;
+                for i in 0..self.boards.len() {
+                    if self.boards[i].name == self.boards[i].fqbn {
+                        self.boards[i].name = self.board_name(&self.boards[i].fqbn);
+                    }
                 }
             }
             AppEvent::Defaults(d) => {
-                if self.board.is_none() && !d.fqbn.is_empty() {
-                    self.board = Some(Board { name: self.board_name(&d.fqbn), fqbn: d.fqbn });
-                    if self.tab == Tab::Boards {
-                        self.tab = Tab::Build;
-                    }
-                }
-                if self.port.is_none() {
-                    self.port = d.port;
+                if self.wants_defaults() && !d.fqbn.is_empty() {
+                    self.boards.push(Target {
+                        name: self.board_name(&d.fqbn),
+                        fqbn: d.fqbn,
+                        port: d.port.map(|p| p.address),
+                        sketch: Some(".".into()),
+                    });
+                    self.tab = Tab::Build;
+                    self.load_baud();
                 }
             }
-            AppEvent::Log(mut line) => {
-                if let Ok(dir) = &self.sketch {
-                    line = line.replace(&format!("{}/", dir.display()), "");
-                }
+            AppEvent::Log(line) => {
+                let line = line
+                    .replace(&format!("{}/", self.root.display()), "")
+                    .replace(&format!("{}/", sketch::scratch().display()), "");
                 self.log.push(line);
                 if self.log_scroll > 0 {
                     self.log_scroll += 1;
@@ -167,10 +206,10 @@ impl App {
                     Ok(false) => format!("✗ {} failed ({secs:.1}s)", job.name),
                     Err(e) => format!("✗ {}: {e}", job.name),
                 });
-                self.after_job();
+                self.next_upload();
             }
             AppEvent::Serial(chunk) => self.push_serial(&chunk),
-            AppEvent::SerialDone(g, r) if g == self.mon_gen => {
+            AppEvent::SerialDone(id, r) if id == self.mon_gen => {
                 self.monitor = None;
                 self.input = None;
                 self.serial_note(match r {
@@ -182,8 +221,27 @@ impl App {
         }
     }
 
-    pub fn port_connected(&self) -> bool {
-        self.port.as_ref().is_some_and(|p| self.ports.iter().any(|d| d.port.address == p.address))
+    // -- lookups --
+
+    pub fn target(&self) -> Option<&Target> {
+        self.boards.get(self.active)
+    }
+
+    pub fn links(&self) -> Vec<Option<usize>> {
+        project::resolve(&self.boards, &self.ports)
+    }
+
+    pub fn port_of(&self, i: usize) -> Option<&Detected> {
+        self.links().get(i).copied().flatten().map(|j| &self.ports[j])
+    }
+
+    pub fn free_ports(&self) -> Vec<usize> {
+        let links = self.links();
+        (0..self.ports.len()).filter(|j| !links.contains(&Some(*j))).collect()
+    }
+
+    pub fn on_port_row(&self) -> bool {
+        self.tab == Tab::Project && self.sel >= self.boards.len()
     }
 
     fn board_name(&self, fqbn: &str) -> String {
@@ -191,11 +249,39 @@ impl App {
         all.iter().find(|b| b.fqbn == fqbn).map_or(fqbn.into(), |b| b.name.clone())
     }
 
-    pub fn filtered(&self) -> Vec<&Board> {
-        let Some(Ok(all)) = &self.all_boards else { return vec![] };
-        let q = self.picker.as_ref().map_or(String::new(), |p| p.query.to_lowercase());
-        all.iter()
-            .filter(|b| b.name.to_lowercase().contains(&q) || b.fqbn.contains(&q))
+    pub fn picks(&self) -> Vec<(String, String)> {
+        let Some(p) = &self.picker else { return vec![] };
+        let items: Vec<(String, String)> = match p.kind {
+            Pick::AddBoard | Pick::Board => match &self.all_boards {
+                Some(Ok(all)) => all.iter().map(|b| (b.name.clone(), b.fqbn.clone())).collect(),
+                _ => vec![],
+            },
+            Pick::Sketch => {
+                let fqbn = self.boards.get(p.target).map(|t| t.fqbn.as_str());
+                let mut v: Vec<(String, String)> = self
+                    .sketches
+                    .iter()
+                    .map(|s| {
+                        let hit = fqbn.is_some() && self.sketch_fqbn.get(s).map(String::as_str) == fqbn;
+                        (s.clone(), if hit { "made for this board".into() } else { String::new() })
+                    })
+                    .collect();
+                v.sort_by_key(|(_, d)| d.is_empty());
+                v
+            }
+            Pick::Port => self
+                .ports
+                .iter()
+                .map(|d| {
+                    let names: Vec<_> = d.matching_boards.iter().map(|b| b.name.as_str()).collect();
+                    (d.port.address.clone(), names.join(", "))
+                })
+                .collect(),
+        };
+        let q = p.query.to_lowercase();
+        items
+            .into_iter()
+            .filter(|(a, b)| a.to_lowercase().contains(&q) || b.to_lowercase().contains(&q))
             .collect()
     }
 
@@ -212,22 +298,28 @@ impl App {
         if self.input.is_some() {
             return self.input_key(k);
         }
+        let focus = if self.tab == Tab::Project { self.sel } else { self.active };
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('1') => self.tab = Tab::Build,
             KeyCode::Char('2') => self.tab = Tab::Monitor,
-            KeyCode::Char('3') => self.tab = Tab::Boards,
+            KeyCode::Char('3') => self.tab = Tab::Project,
             KeyCode::Tab => self.cycle_tab(1),
             KeyCode::BackTab => self.cycle_tab(Tab::ALL.len() - 1),
-            KeyCode::Char('b') => self.open_picker(),
+            KeyCode::Char('a') => self.open(Pick::AddBoard, 0),
+            KeyCode::Char('b') if focus >= self.boards.len() => self.open(Pick::AddBoard, 0),
+            KeyCode::Char('b') => self.open(Pick::Board, focus),
+            KeyCode::Char('s') if focus < self.boards.len() => self.open(Pick::Sketch, focus),
+            KeyCode::Char('p') if focus < self.boards.len() => self.open(Pick::Port, focus),
             KeyCode::Char('c') => self.compile(),
             KeyCode::Char('u') => self.upload(),
+            KeyCode::Char('F') => self.flash_all(),
             KeyCode::Char('m') => self.toggle_monitor(),
             KeyCode::Esc if self.job.is_some() => self.cancel(),
             _ => match self.tab {
                 Tab::Build => scroll(&mut self.log_scroll, self.log.len(), k.code),
                 Tab::Monitor => self.monitor_key(k),
-                Tab::Boards => self.boards_key(k),
+                Tab::Project => self.project_key(k),
             },
         }
     }
@@ -237,13 +329,33 @@ impl App {
         self.tab = Tab::ALL[(i + by) % Tab::ALL.len()];
     }
 
-    fn boards_key(&mut self, k: KeyEvent) {
+    fn project_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                self.sel = (self.sel + 1).min(self.ports.len().saturating_sub(1))
+                let rows = self.boards.len() + self.free_ports().len();
+                self.sel = (self.sel + 1).min(rows.saturating_sub(1))
             }
             KeyCode::Up | KeyCode::Char('k') => self.sel = self.sel.saturating_sub(1),
-            KeyCode::Enter => self.choose_port(),
+            KeyCode::Enter if self.sel >= self.boards.len() => {
+                if let Some(&j) = self.free_ports().get(self.sel - self.boards.len()) {
+                    self.add_from_port(j);
+                }
+            }
+            KeyCode::Enter => {
+                if self.sel != self.active {
+                    self.stop_monitor();
+                }
+                self.active = self.sel;
+                self.load_baud();
+            }
+            KeyCode::Char('d') if self.sel < self.boards.len() => {
+                self.boards.remove(self.sel);
+                if self.active > self.sel || self.active >= self.boards.len() {
+                    self.active = self.active.saturating_sub(1);
+                }
+                self.sel = self.sel.min(self.boards.len().saturating_sub(1));
+                self.save(None);
+            }
             _ => {}
         }
     }
@@ -279,19 +391,27 @@ impl App {
         }
     }
 
+    // -- pickers --
+
+    fn open(&mut self, kind: Pick, target: usize) {
+        self.picker = Some(Picker { kind, target, query: String::new(), sel: 0 });
+    }
+
     fn picker_key(&mut self, k: KeyEvent) {
         match k.code {
-            KeyCode::Esc => self.picker = None,
+            KeyCode::Esc => {
+                self.picker = None;
+                self.pending_port = None;
+            }
             KeyCode::Enter => {
-                let sel = self.picker.as_ref().map_or(0, |p| p.sel);
-                if let Some(b) = self.filtered().get(sel).map(|b| (*b).clone()) {
-                    self.board = Some(b);
-                    self.picker = None;
-                    self.save();
-                }
+                let Some(p) = &self.picker else { return };
+                let Some((label, detail)) = self.picks().into_iter().nth(p.sel) else { return };
+                let (kind, i) = (p.kind, p.target);
+                self.picker = None;
+                self.apply(kind, i, label, detail);
             }
             code => {
-                let n = self.filtered().len();
+                let n = self.picks().len();
                 let Some(p) = self.picker.as_mut() else { return };
                 match code {
                     KeyCode::Down => p.sel = (p.sel + 1).min(n.saturating_sub(1)),
@@ -310,35 +430,104 @@ impl App {
         }
     }
 
-    // -- boards --
-
-    fn open_picker(&mut self) {
-        self.picker = Some(Picker { query: String::new(), sel: 0 });
-    }
-
-    fn choose_port(&mut self) {
-        let Some(d) = self.ports.get(self.sel) else { return };
-        self.port = Some(d.port.clone());
-        match d.matching_boards.iter().find(|b| !b.fqbn.is_empty()) {
-            Some(b) => self.board = Some(b.clone()),
-            None if self.board.is_none() => self.open_picker(),
-            None => {}
+    fn apply(&mut self, kind: Pick, i: usize, label: String, detail: String) {
+        match kind {
+            Pick::AddBoard => {
+                let port = self.pending_port.take();
+                self.add_board(label, detail, port);
+            }
+            Pick::Board => {
+                if let Some(t) = self.boards.get_mut(i) {
+                    t.name = label;
+                    t.fqbn = detail;
+                    self.save(Some(i));
+                }
+            }
+            Pick::Sketch => self.set_sketch(i, label),
+            Pick::Port => {
+                if let Some(t) = self.boards.get_mut(i) {
+                    t.port = Some(label);
+                    self.save(Some(i));
+                }
+            }
         }
-        self.save();
     }
 
-    fn save(&self) {
-        let Ok(dir) = self.sketch.clone() else { return };
-        let fqbn = self.board.as_ref().map(|b| b.fqbn.clone());
-        let (port, baud, tx) = (self.port.clone(), self.baud, self.tx.clone());
+    fn add_from_port(&mut self, j: usize) {
+        let d = &self.ports[j];
+        let port = Some(d.port.address.clone());
+        match d.matching_boards.iter().find(|b| !b.fqbn.is_empty()) {
+            Some(b) => self.add_board(b.name.clone(), b.fqbn.clone(), port),
+            None => {
+                self.pending_port = port;
+                self.open(Pick::AddBoard, 0);
+            }
+        }
+    }
+
+    fn add_board(&mut self, name: String, fqbn: String, port: Option<String>) {
+        let made_for: Vec<String> =
+            self.sketches.iter().filter(|s| self.sketch_fqbn.get(*s) == Some(&fqbn)).cloned().collect();
+        self.boards.push(Target { name, fqbn, port, sketch: None });
+        let i = self.boards.len() - 1;
+        self.sel = i;
+        self.tab = Tab::Project;
+        if i == 0 {
+            self.active = 0;
+        }
+        match made_for.as_slice() {
+            [only] => self.set_sketch(i, only.clone()),
+            _ => {
+                self.save(None);
+                self.open(Pick::Sketch, i);
+            }
+        }
+    }
+
+    fn set_sketch(&mut self, i: usize, rel: String) {
+        let dir = sketch::folder(&self.root, &rel);
+        let Some(t) = self.boards.get_mut(i) else { return };
+        if t.port.is_none() {
+            t.port = dir.and_then(|d| sketch::yaml_value(&d, "default_port"));
+        }
+        t.sketch = Some(rel);
+        if i == self.active {
+            self.load_baud();
+        }
+        self.save(Some(i));
+    }
+
+    // -- saving --
+
+    fn save(&mut self, mirror: Option<usize>) {
+        self.save_with(mirror, false);
+    }
+
+    fn save_with(&mut self, mirror: Option<usize>, with_baud: bool) {
+        if self.project_err.is_some() {
+            return self.log.push("✗ fluxus.yaml didn't parse, not overwriting it — fix it by hand".into());
+        }
+        let single = self.root_is_sketch && self.boards.len() <= 1;
+        if !single && let Err(e) = project::save(&self.root, &self.boards) {
+            self.log.push(format!("✗ couldn't save fluxus.yaml: {e:#}"));
+        }
+        let Some(i) = mirror else { return };
+        let Some(t) = self.boards.get(i).cloned() else { return };
+        let Some(rel) = t.sketch.clone() else { return };
+        let Some(dir) = sketch::folder(&self.root, &rel) else { return };
+        self.sketch_fqbn.insert(rel, t.fqbn.clone());
+        let port = self.port_of(i).map(|d| d.port.clone()).or(t.port.map(|address| Port { address, ..Default::default() }));
+        let baud = (with_baud && i == self.active).then_some(self.baud);
+        let tx = self.tx.clone();
         tokio::spawn(async move {
             static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
             let _held = LOCK.lock().await;
             let r = async {
-                if fqbn.is_some() || port.is_some() {
-                    cli::attach(&dir, fqbn.as_deref(), port.as_ref()).await?;
+                cli::attach(&dir, Some(&t.fqbn), port.as_ref()).await?;
+                match baud {
+                    Some(b) => sketch::save_baud(&dir, b),
+                    None => Ok(()),
                 }
-                sketch::save_baud(&dir, baud)
             };
             if let Err(e) = r.await {
                 let _ = tx.send(AppEvent::Log(format!("✗ couldn't save sketch.yaml: {e:#}")));
@@ -346,55 +535,96 @@ impl App {
         });
     }
 
+    fn load_baud(&mut self) {
+        let dir = self.target().and_then(|t| t.sketch.as_deref()).and_then(|s| sketch::folder(&self.root, s));
+        if let Some(b) = dir.and_then(|d| sketch::load_baud(&d)) {
+            self.baud = b;
+        }
+    }
+
     // -- build jobs --
 
+    fn prepared(&mut self, i: usize) -> Option<(String, PathBuf, String)> {
+        let Some(t) = self.boards.get(i) else {
+            self.log.push("✗ no boards yet — press a to add one".into());
+            return None;
+        };
+        let Some(rel) = t.sketch.clone() else {
+            self.log.push(format!("✗ {} has no sketch — press s", t.name));
+            return None;
+        };
+        let (name, fqbn) = (t.name.clone(), t.fqbn.clone());
+        match sketch::build_dir(&self.root, &rel) {
+            Ok(dir) => Some((name, dir, fqbn)),
+            Err(e) => {
+                self.log.push(format!("✗ {name}: {e:#}"));
+                None
+            }
+        }
+    }
+
     fn compile(&mut self) {
-        let Some((sketch, fqbn)) = self.ready_to_build() else { return };
-        self.run_job("compile", vec!["compile".into(), "-b".into(), fqbn.into(), sketch.into()]);
+        self.tab = Tab::Build;
+        if self.job.is_some() {
+            return;
+        }
+        self.log.clear();
+        self.log_scroll = 0;
+        let Some((name, dir, fqbn)) = self.prepared(self.active) else { return };
+        self.run_job(format!("compile {name}"), vec!["compile".into(), "-b".into(), fqbn.into(), dir.into()]);
     }
 
     fn upload(&mut self) {
-        let Some((sketch, fqbn)) = self.ready_to_build() else { return };
-        let Some(port) = self.port.clone() else {
-            return self.log.push("✗ no port selected — pick one in Boards (3)".into());
-        };
-        // dont touch, port stays busy otherwise
-        self.resume_monitor = self.monitor.is_some();
-        self.stop_monitor();
-        let mut args: Vec<OsString> = vec!["compile".into(), "-u".into(), "-b".into(), fqbn.into()];
-        args.extend(["-p".into(), port.address.into()]);
-        if !port.protocol.is_empty() {
-            args.extend(["-l".into(), port.protocol.into()]);
-        }
-        args.push(sketch.into());
-        self.run_job("upload", args);
+        self.start_uploads(vec![self.active]);
     }
 
-    fn ready_to_build(&mut self) -> Option<(PathBuf, String)> {
+    fn flash_all(&mut self) {
+        let links = self.links();
+        let with_sketch: Vec<usize> = (0..self.boards.len()).filter(|&i| self.boards[i].sketch.is_some()).collect();
+        if !with_sketch.iter().any(|&i| links[i].is_some()) {
+            self.tab = Tab::Build;
+            return self.log.push("✗ flash all: no connected boards with a sketch".into());
+        }
+        self.start_uploads(with_sketch);
+    }
+
+    fn start_uploads(&mut self, which: Vec<usize>) {
         self.tab = Tab::Build;
         if self.job.is_some() {
-            return None;
+            return;
         }
-        let sketch = match &self.sketch {
-            Ok(s) => s.clone(),
-            Err(e) => {
-                self.log.push(format!("✗ {e}"));
-                return None;
-            }
-        };
-        let Some(board) = &self.board else {
-            self.log.push("✗ no board selected — press b".into());
-            return None;
-        };
-        Some((sketch, board.fqbn.clone()))
-    }
-
-    fn run_job(&mut self, name: &'static str, args: Vec<OsString>) {
         self.log.clear();
         self.log_scroll = 0;
-        let shown: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
-        self.log.push(format!("$ arduino-cli {}", shown.join(" ")));
+        // dont touch, port stays busy otherwise
+        self.resume_monitor |= self.monitor.is_some();
+        self.stop_monitor();
+        self.queue = which.into();
+        self.next_upload();
+    }
 
+    fn next_upload(&mut self) {
+        while let Some(i) = self.queue.pop_front() {
+            let Some((name, dir, fqbn)) = self.prepared(i) else { continue };
+            let Some(port) = self.port_of(i).map(|d| d.port.clone()) else {
+                self.log.push(format!("✗ {name} isn't connected — plug it in or press p"));
+                continue;
+            };
+            let mut args: Vec<OsString> = vec!["compile".into(), "-u".into(), "-b".into(), fqbn.into()];
+            args.extend(["-p".into(), port.address.into()]);
+            if !port.protocol.is_empty() {
+                args.extend(["-l".into(), port.protocol.into()]);
+            }
+            args.push(dir.into());
+            return self.run_job(format!("upload {name}"), args);
+        }
+        if std::mem::take(&mut self.resume_monitor) {
+            self.start_monitor();
+        }
+    }
+
+    fn run_job(&mut self, name: String, args: Vec<OsString>) {
+        let shown: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+        self.event(AppEvent::Log(format!("$ arduino-cli {}", shown.join(" "))));
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             let r = cli::stream(args, &tx).await.map_err(|e| format!("{e:#}"));
@@ -407,13 +637,8 @@ impl App {
         if let Some(job) = self.job.take() {
             job.handle.abort();
             self.log.push(format!("✗ {} cancelled", job.name));
-            self.after_job();
-        }
-    }
-
-    fn after_job(&mut self) {
-        if std::mem::take(&mut self.resume_monitor) {
-            self.start_monitor();
+            self.queue.clear();
+            self.next_upload();
         }
     }
 
@@ -423,7 +648,7 @@ impl App {
         self.tab = Tab::Monitor;
         if self.monitor.is_some() {
             self.stop_monitor();
-        } else if self.job.as_ref().is_some_and(|j| j.name == "upload") {
+        } else if !self.queue.is_empty() || self.job.as_ref().is_some_and(|j| j.name.starts_with("upload")) {
             self.resume_monitor = true;
         } else {
             self.start_monitor();
@@ -431,8 +656,8 @@ impl App {
     }
 
     fn start_monitor(&mut self) {
-        let Some(port) = self.port.clone() else {
-            return self.serial_note("── no port selected — pick one in Boards (3) ──".into());
+        let Some(port) = self.port_of(self.active).map(|d| d.port.clone()) else {
+            return self.serial_note("── active board isn't connected ──".into());
         };
         self.mon_gen += 1;
         let (id, baud, tx) = (self.mon_gen, self.baud, self.tx.clone());
@@ -457,7 +682,7 @@ impl App {
     fn step_baud(&mut self, by: isize) {
         let i = BAUDS.iter().position(|b| *b == self.baud).unwrap_or(4) as isize;
         self.baud = BAUDS[(i + by).clamp(0, BAUDS.len() as isize - 1) as usize];
-        self.save();
+        self.save_with(Some(self.active), true);
         if self.monitor.is_some() {
             self.stop_monitor();
             self.start_monitor();
@@ -514,12 +739,47 @@ mod tests {
     #[test]
     fn serial_chunks_join_into_lines() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new(String::new(), Err(String::new()), tx);
+        let mut app = App::new(String::new(), std::env::temp_dir().join("fluxus-none"), tx);
         for chunk in ["tem", "p: 21\r\nhum", "id: 40\r\n", "no newline"] {
             app.push_serial(chunk);
         }
         assert_eq!(app.serial, ["temp: 21", "humid: 40", "no newline"]);
         app.serial_note("── closed ──".into());
         assert_eq!(app.serial[3..], ["── closed ──", ""]);
+    }
+
+    #[tokio::test]
+    async fn detected_port_adds_board_and_guesses_sketch() {
+        let root = std::env::temp_dir().join(format!("fluxus-add-{}", std::process::id()));
+        for (dir, fqbn) in [("giga-r1/main", "arduino:mbed_giga:giga"), ("cam/main", "esp32:esp32:esp32cam"), ("cam/test", "esp32:esp32:esp32cam")] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            let name = dir.rsplit('/').next().unwrap();
+            std::fs::write(root.join(dir).join(format!("{name}.ino")), "").unwrap();
+            std::fs::write(root.join(dir).join("sketch.yaml"), format!("default_fqbn: {fqbn}\n")).unwrap();
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(String::new(), root.clone(), tx);
+        let port = |a: &str| Port { address: a.into(), ..Default::default() };
+        let giga = Board { name: "Arduino Giga R1".into(), fqbn: "arduino:mbed_giga:giga".into() };
+        app.event(AppEvent::Ports(Ok(vec![
+            Detected { port: port("/dev/cu.usbmodem1101"), matching_boards: vec![giga] },
+            Detected { port: port("/dev/cu.usbserial-110"), matching_boards: vec![] },
+        ])));
+        assert_eq!(app.free_ports(), [0, 1]);
+
+        app.add_from_port(0);
+        assert_eq!(app.boards[0].sketch.as_deref(), Some("giga-r1/main"));
+        assert_eq!(app.boards[0].port.as_deref(), Some("/dev/cu.usbmodem1101"));
+        assert!(app.picker.is_none());
+        assert_eq!(app.free_ports(), [1]);
+
+        app.add_from_port(1);
+        assert!(app.picker.as_ref().is_some_and(|p| p.kind == Pick::AddBoard));
+        app.apply(Pick::AddBoard, 0, "AI Thinker ESP32-CAM".into(), "esp32:esp32:esp32cam".into());
+        assert_eq!(app.boards[1].port.as_deref(), Some("/dev/cu.usbserial-110"));
+        assert!(app.picker.as_ref().is_some_and(|p| p.kind == Pick::Sketch));
+        let picks: Vec<_> = app.picks().into_iter().map(|(s, _)| s).collect();
+        assert_eq!(picks, ["cam/main", "cam/test", "giga-r1/main"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
