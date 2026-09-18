@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
@@ -90,6 +91,35 @@ pub async fn board_listall() -> Result<Vec<Board>> {
         boards: Vec<Board>,
     }
     Ok(json::<R>(&["board", "listall"]).await?.boards)
+}
+
+// -- sketch.yaml --
+
+#[derive(Deserialize)]
+pub struct Attached {
+    #[serde(default)]
+    pub fqbn: String,
+    pub port: Option<Port>,
+}
+
+pub async fn attached(sketch: &Path) -> Result<Attached> {
+    json(&["board", "attach", &sketch.to_string_lossy()]).await
+}
+
+pub async fn attach(sketch: &Path, fqbn: Option<&str>, port: Option<&Port>) -> Result<()> {
+    let mut args = vec!["board".to_string(), "attach".into()];
+    if let Some(f) = fqbn {
+        args.extend(["-b".into(), f.into()]);
+    }
+    if let Some(p) = port {
+        args.extend(["-p".into(), p.address.clone()]);
+        if !p.protocol.is_empty() {
+            args.extend(["-l".into(), p.protocol.clone()]);
+        }
+    }
+    args.push(sketch.to_string_lossy().into_owned());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    json::<serde_json::Value>(&args).await.map(drop)
 }
 
 // -- streaming --

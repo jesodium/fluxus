@@ -44,6 +44,14 @@ async fn main() -> Result<()> {
             tokio::time::sleep(PORT_POLL).await;
         }
     });
+    if let Ok(dir) = app.sketch.clone() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Ok(d) = cli::attached(&dir).await {
+                let _ = tx.send(AppEvent::Defaults(d));
+            }
+        });
+    }
     tokio::spawn(async move {
         let r = cli::board_listall().await.map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::AllBoards(r));

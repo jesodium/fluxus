@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::cli::{self, Board, Detected, Port};
+use crate::cli::{self, Attached, Board, Detected, Port};
+use crate::sketch;
 
 pub const BAUDS: [u32; 15] = [
     300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 74880, 115200, 230400, 250000, 500000, 1000000, 2000000,
@@ -20,6 +21,7 @@ pub enum AppEvent {
     JobDone(Result<bool, String>),
     Serial(String),
     SerialDone(u64, Result<(), String>),
+    Defaults(Attached),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,6 +92,7 @@ pub struct App {
 
 impl App {
     pub fn new(cli_version: String, sketch: Result<PathBuf, String>, tx: UnboundedSender<AppEvent>) -> Self {
+        let baud = sketch.as_ref().ok().and_then(|d| sketch::load_baud(d)).unwrap_or(9600);
         Self {
             tx,
             cli_version,
@@ -108,7 +111,7 @@ impl App {
             job: None,
             serial: vec![],
             serial_scroll: 0,
-            baud: 9600,
+            baud,
             monitor: None,
             mon_gen: 0,
             resume_monitor: false,
@@ -129,7 +132,24 @@ impl App {
                 self.sel = self.sel.min(self.ports.len().saturating_sub(1));
             }
             AppEvent::Ports(Err(e)) => self.ports_err = Some(e),
-            AppEvent::AllBoards(r) => self.all_boards = Some(r),
+            AppEvent::AllBoards(r) => {
+                self.all_boards = Some(r);
+                if let Some(b) = &self.board {
+                    let name = self.board_name(&b.fqbn);
+                    self.board.as_mut().expect("checked").name = name;
+                }
+            }
+            AppEvent::Defaults(d) => {
+                if self.board.is_none() && !d.fqbn.is_empty() {
+                    self.board = Some(Board { name: self.board_name(&d.fqbn), fqbn: d.fqbn });
+                    if self.tab == Tab::Boards {
+                        self.tab = Tab::Build;
+                    }
+                }
+                if self.port.is_none() {
+                    self.port = d.port;
+                }
+            }
             AppEvent::Log(mut line) => {
                 if let Ok(dir) = &self.sketch {
                     line = line.replace(&format!("{}/", dir.display()), "");
@@ -164,6 +184,11 @@ impl App {
 
     pub fn port_connected(&self) -> bool {
         self.port.as_ref().is_some_and(|p| self.ports.iter().any(|d| d.port.address == p.address))
+    }
+
+    fn board_name(&self, fqbn: &str) -> String {
+        let Some(Ok(all)) = &self.all_boards else { return fqbn.into() };
+        all.iter().find(|b| b.fqbn == fqbn).map_or(fqbn.into(), |b| b.name.clone())
     }
 
     pub fn filtered(&self) -> Vec<&Board> {
@@ -262,6 +287,7 @@ impl App {
                 if let Some(b) = self.filtered().get(sel).map(|b| (*b).clone()) {
                     self.board = Some(b);
                     self.picker = None;
+                    self.save();
                 }
             }
             code => {
@@ -298,6 +324,26 @@ impl App {
             None if self.board.is_none() => self.open_picker(),
             None => {}
         }
+        self.save();
+    }
+
+    fn save(&self) {
+        let Ok(dir) = self.sketch.clone() else { return };
+        let fqbn = self.board.as_ref().map(|b| b.fqbn.clone());
+        let (port, baud, tx) = (self.port.clone(), self.baud, self.tx.clone());
+        tokio::spawn(async move {
+            static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _held = LOCK.lock().await;
+            let r = async {
+                if fqbn.is_some() || port.is_some() {
+                    cli::attach(&dir, fqbn.as_deref(), port.as_ref()).await?;
+                }
+                sketch::save_baud(&dir, baud)
+            };
+            if let Err(e) = r.await {
+                let _ = tx.send(AppEvent::Log(format!("✗ couldn't save sketch.yaml: {e:#}")));
+            }
+        });
     }
 
     // -- build jobs --
@@ -411,6 +457,7 @@ impl App {
     fn step_baud(&mut self, by: isize) {
         let i = BAUDS.iter().position(|b| *b == self.baud).unwrap_or(4) as isize;
         self.baud = BAUDS[(i + by).clamp(0, BAUDS.len() as isize - 1) as usize];
+        self.save();
         if self.monitor.is_some() {
             self.stop_monitor();
             self.start_monitor();
