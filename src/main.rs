@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod project;
+mod settings;
 mod sketch;
 mod ui;
 

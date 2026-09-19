@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::cli::{self, Attached, Board, Detected, Port};
 use crate::project::{self, Target};
+use crate::settings::{self, Settings};
 use crate::sketch;
 
 pub const BAUDS: [u32; 15] = [
@@ -31,16 +32,18 @@ pub enum Tab {
     Build,
     Monitor,
     Project,
+    Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Build, Tab::Monitor, Tab::Project];
+    pub const ALL: [Tab; 4] = [Tab::Build, Tab::Monitor, Tab::Project, Tab::Settings];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Build => "Build",
             Tab::Monitor => "Monitor",
             Tab::Project => "Project",
+            Tab::Settings => "Settings",
         }
     }
 }
@@ -110,6 +113,9 @@ pub struct App {
     resume: Vec<usize>,
     pub input: Option<String>,
 
+    pub settings: Settings,
+    pub set_sel: usize,
+
     pub quit: bool,
 }
 
@@ -150,6 +156,8 @@ impl App {
             mon_gen: 0,
             resume: vec![],
             input: None,
+            settings: settings::load(),
+            set_sel: 0,
             quit: false,
         };
         for i in 0..app.boards.len() {
@@ -258,10 +266,16 @@ impl App {
     }
 
     pub fn no_boards(&self) -> String {
-        match self.ports.len() {
+        // skip bluetooth/debug leftovers, they're never boards
+        let boards = self
+            .ports
+            .iter()
+            .filter(|d| d.port.protocol_label.contains("USB") || d.matching_boards.iter().any(|b| !b.fqbn.is_empty()))
+            .count();
+        match boards {
             0 => "no boards in project — plug one in, or press a to add one".into(),
-            1 => "1 board plugged in but not in project — press 3, then enter to add it".into(),
-            n => format!("{n} boards plugged in but not in project — press 3, then enter to add them"),
+            1 => "detected 1 board — press 3, then enter to add it".into(),
+            n => format!("detected {n} boards — press 3, then enter to add them"),
         }
     }
 
@@ -338,6 +352,7 @@ impl App {
             KeyCode::Char('1') => self.tab = Tab::Build,
             KeyCode::Char('2') => self.tab = Tab::Monitor,
             KeyCode::Char('3') => self.tab = Tab::Project,
+            KeyCode::Char('4') => self.tab = Tab::Settings,
             KeyCode::Tab => self.cycle_tab(1),
             KeyCode::BackTab => self.cycle_tab(Tab::ALL.len() - 1),
             KeyCode::Char('a') => self.open(Pick::AddBoard, 0),
@@ -359,6 +374,7 @@ impl App {
                 Tab::Build => scroll(&mut self.log_scroll, self.log.len(), k.code),
                 Tab::Monitor => self.monitor_key(k),
                 Tab::Project => self.project_key(k),
+                Tab::Settings => self.settings_key(k),
             },
         }
     }
@@ -398,6 +414,20 @@ impl App {
         }
     }
 
+    fn settings_key(&mut self, k: KeyEvent) {
+        let by = match k.code {
+            KeyCode::Down | KeyCode::Char('j') => return self.set_sel = (self.set_sel + 1).min(settings::ROWS - 1),
+            KeyCode::Up | KeyCode::Char('k') => return self.set_sel = self.set_sel.saturating_sub(1),
+            KeyCode::Left | KeyCode::Char('h') => -1,
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => 1,
+            _ => return,
+        };
+        self.settings.step(self.set_sel, by);
+        if let Err(e) = settings::save(&self.settings) {
+            self.log.push(format!("✗ couldn't save settings: {e:#}"));
+        }
+    }
+
     fn monitor_key(&mut self, k: KeyEvent) {
         let Some(p) = self.panes.get_mut(self.active) else { return };
         match k.code {
@@ -427,7 +457,7 @@ impl App {
                 if let Some(p) = self.panes.get_mut(self.active)
                     && let Some(l) = &p.link
                 {
-                    let _ = l.input.send(line.clone() + "\n");
+                    let _ = l.input.send(line.clone() + self.settings.eol());
                     p.note(format!("→ {line}"));
                 }
             }
@@ -618,7 +648,11 @@ impl App {
         self.log.clear();
         self.log_scroll = 0;
         let Some((name, dir, fqbn)) = self.prepared(self.active) else { return };
-        self.run_job(format!("compile {name}"), vec!["compile".into(), "-b".into(), fqbn.into(), dir.into()]);
+        let mut args: Vec<OsString> = vec!["compile".into(), "-b".into(), fqbn.into(), dir.into()];
+        if self.settings.verbose {
+            args.push("-v".into());
+        }
+        self.run_job(format!("compile {name}"), args);
     }
 
     fn install_core(&mut self, core: String) {
@@ -679,6 +713,9 @@ impl App {
             args.extend(["-p".into(), port.address.into()]);
             if !port.protocol.is_empty() {
                 args.extend(["-l".into(), port.protocol.into()]);
+            }
+            if self.settings.verbose {
+                args.push("-v".into());
             }
             args.push(dir.into());
             return self.run_job(format!("upload {name}"), args);
@@ -760,7 +797,7 @@ impl App {
     }
 
     fn new_pane(&mut self, i: usize) {
-        self.panes.insert(i, Pane { lines: vec![], scroll: 0, baud: 9600, link: None });
+        self.panes.insert(i, Pane { lines: vec![], scroll: 0, baud: self.settings.baud, link: None });
         self.load_baud(i);
     }
 
