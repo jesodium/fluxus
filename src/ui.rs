@@ -352,15 +352,78 @@ fn picker(f: &mut Frame, app: &App, p: &Picker) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .picks()
-        .into_iter()
-        .map(|(label, detail)| ListItem::new(Line::from(vec![format!(" {label:<40}").into(), detail.fg(DIM)])))
-        .collect();
+    let picks = app.picks();
+    let items: Vec<ListItem> = if p.kind == Pick::Sketch {
+        let root = app.root.file_name().map_or("sketch".into(), |n| n.to_string_lossy().into_owned());
+        let labels: Vec<&str> = picks.iter().map(|(l, _)| l.as_str()).collect();
+        tree(&labels, &root)
+            .into_iter()
+            .zip(&picks)
+            .enumerate()
+            .map(|(i, ((dirs, depth, file), (_, detail)))| {
+                let mut lines: Vec<Line> =
+                    dirs.into_iter().map(|(d, name)| format!(" {}{name}/", "  ".repeat(d)).fg(DIM).into()).collect();
+                let mut leaf = Line::from(vec![
+                    " ".repeat(1 + 2 * depth).into(),
+                    Span::styled(file, Style::new().fg(GOOD).bold()),
+                    format!("  {detail}").fg(DIM),
+                ]);
+                if i == p.sel {
+                    leaf = leaf.bg(SELECT_BG);
+                }
+                lines.push(leaf);
+                ListItem::new(lines)
+            })
+            .collect()
+    } else {
+        picks
+            .into_iter()
+            .map(|(label, detail)| ListItem::new(Line::from(vec![format!(" {label:<40}").into(), detail.fg(DIM)])))
+            .collect()
+    };
+    let highlight = if p.kind == Pick::Sketch { Style::new() } else { Style::new().bg(SELECT_BG) };
     let mut state = ListState::default().with_selected(Some(p.sel));
     f.render_stateful_widget(
-        List::new(items).block(block).highlight_style(Style::new().bg(SELECT_BG)),
+        List::new(items).block(block).highlight_style(highlight),
         area,
         &mut state,
     );
+}
+
+// dirs not shared with the row above, then the .ino itself
+type TreeRow = (Vec<(usize, String)>, usize, String);
+
+fn tree(labels: &[&str], root: &str) -> Vec<TreeRow> {
+    let mut prev: Vec<&str> = vec![];
+    labels
+        .iter()
+        .map(|&l| {
+            let mut parts: Vec<&str> = if l == "." { vec![] } else { l.split('/').collect() };
+            let file = match parts.last() {
+                Some(f) if f.ends_with(".ino") => parts.pop().unwrap().to_string(),
+                Some(f) => format!("{f}.ino"),
+                None => format!("{root}.ino"),
+            };
+            let shared = prev.iter().zip(&parts).take_while(|(a, b)| a == b).count();
+            let dirs = parts.iter().enumerate().skip(shared).map(|(d, n)| (d, n.to_string())).collect();
+            let depth = parts.len();
+            prev = parts;
+            (dirs, depth, file)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_shares_parent_dirs() {
+        let rows = tree(&["giga-r1/i2c_scan", "giga-r1/main", "scratchpad/motor_test.ino", "."], "blackout");
+        let d = |v: &[(usize, &str)]| v.iter().map(|&(i, s)| (i, s.to_string())).collect::<Vec<_>>();
+        assert_eq!(rows[0], (d(&[(0, "giga-r1"), (1, "i2c_scan")]), 2, "i2c_scan.ino".into()));
+        assert_eq!(rows[1], (d(&[(1, "main")]), 2, "main.ino".into()));
+        assert_eq!(rows[2], (d(&[(0, "scratchpad")]), 1, "motor_test.ino".into()));
+        assert_eq!(rows[3], (vec![], 0, "blackout.ino".into()));
+    }
 }
