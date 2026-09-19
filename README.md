@@ -68,9 +68,43 @@ boards:
 
 If you open a single sketch folder, you don't need this file. fluxus uses the board and port from the sketch's `sketch.yaml`.
 
-## Requirements
+## Install
 
-[arduino-cli](https://arduino.github.io/arduino-cli/) 1.0 or newer on your `PATH`.
+fluxus needs [arduino-cli](https://arduino.github.io/arduino-cli/latest/installation/) 1.0 or newer on your `PATH` (`brew install arduino-cli` on macOS).
+
+Prebuilt binaries are for macOS and Linux (x86_64 and arm64).
+
+**Install script**
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jesodium/fluxus/releases/latest/download/fluxus-arduino-installer.sh | sh
+```
+
+**Download a binary**
+
+Get the archive for your platform from [releases](https://github.com/jesodium/fluxus/releases/latest), extract it and put `fluxus` somewhere on your `PATH`.
+
+**Cargo**
+
+```sh
+cargo install --locked --git https://github.com/jesodium/fluxus
+```
+
+**From source**
+
+```sh
+git clone https://github.com/jesodium/fluxus
+cd fluxus
+cargo build --release
+./target/release/fluxus
+```
+
+## Usage
+
+```sh
+fluxus            # current folder
+fluxus ~/my-proj  # a project folder or a single sketch
+```
 
 ## License
 
