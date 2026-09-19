@@ -23,6 +23,8 @@ pub struct Board {
     pub name: String,
     #[serde(default)]
     pub fqbn: String,
+    #[serde(skip)]
+    pub core: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -84,13 +86,38 @@ pub async fn board_list() -> Result<Vec<Detected>> {
     Ok(json::<BoardList>(&["board", "list"]).await?.detected_ports)
 }
 
-pub async fn board_listall() -> Result<Vec<Board>> {
-    #[derive(Deserialize)]
-    struct R {
-        #[serde(default)]
-        boards: Vec<Board>,
+// search, not listall: it also lists boards whose core isn't installed yet (no fqbn)
+pub async fn board_search() -> Result<Vec<Board>> {
+    Ok(json::<Search>(&["board", "search"]).await?.boards())
+}
+
+#[derive(Deserialize)]
+struct Search {
+    #[serde(default)]
+    boards: Vec<Found>,
+}
+
+#[derive(Deserialize)]
+struct Found {
+    #[serde(flatten)]
+    board: Board,
+    platform: Platform,
+}
+
+#[derive(Deserialize)]
+struct Platform {
+    metadata: Meta,
+}
+
+#[derive(Deserialize)]
+struct Meta {
+    id: String,
+}
+
+impl Search {
+    fn boards(self) -> Vec<Board> {
+        self.boards.into_iter().map(|f| Board { core: f.platform.metadata.id, ..f.board }).collect()
     }
-    Ok(json::<R>(&["board", "listall"]).await?.boards)
 }
 
 // -- sketch.yaml --
@@ -168,7 +195,7 @@ pub async fn stream<S: AsRef<OsStr>>(
 fn lines(
     r: impl AsyncRead + Unpin + Send + 'static,
     tx: UnboundedSender<AppEvent>,
-    wrap: fn(String) -> AppEvent,
+    wrap: impl Fn(String) -> AppEvent + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut r = BufReader::new(r);
@@ -183,6 +210,7 @@ fn lines(
 // -- serial monitor --
 
 pub async fn monitor(
+    id: u64,
     port: Port,
     baud: u32,
     mut input: UnboundedReceiver<String>,
@@ -196,7 +224,7 @@ pub async fn monitor(
     let (mut child, mut group) = spawn(args)?;
     let mut stdin = child.stdin.take().expect("piped");
     let mut out = child.stdout.take().expect("piped");
-    lines(child.stderr.take().expect("piped"), tx.clone(), |l| AppEvent::Serial(l + "\n"));
+    lines(child.stderr.take().expect("piped"), tx.clone(), move |l| AppEvent::Serial(id, l + "\n"));
 
     // for Serial.print without newline
     let mut buf = [0u8; 4096];
@@ -204,7 +232,7 @@ pub async fn monitor(
         tokio::select! {
             n = out.read(&mut buf) => match n? {
                 0 => break,
-                n => { let _ = tx.send(AppEvent::Serial(String::from_utf8_lossy(&buf[..n]).into_owned())); }
+                n => { let _ = tx.send(AppEvent::Serial(id, String::from_utf8_lossy(&buf[..n]).into_owned())); }
             },
             Some(s) = input.recv() => stdin.write_all(s.as_bytes()).await?,
         }
@@ -235,5 +263,16 @@ mod tests {
         assert!(d[1].matching_boards.is_empty());
         assert_eq!(d[2].matching_boards[0].fqbn, "");
         assert!(serde_json::from_str::<BoardList>("{}").unwrap().detected_ports.is_empty());
+    }
+
+    #[test]
+    fn parses_board_search() {
+        let raw = r#"{"boards":[
+            {"name":"Arduino Uno","fqbn":"arduino:avr:uno","platform":{"metadata":{"id":"arduino:avr"},"release":{"installed":true}}},
+            {"name":"Arduino Due","platform":{"metadata":{"id":"arduino:sam"},"release":{}}}
+        ]}"#;
+        let b = serde_json::from_str::<Search>(raw).unwrap().boards();
+        assert_eq!((b[0].fqbn.as_str(), b[0].core.as_str()), ("arduino:avr:uno", "arduino:avr"));
+        assert_eq!((b[1].fqbn.as_str(), b[1].core.as_str()), ("", "arduino:sam"));
     }
 }

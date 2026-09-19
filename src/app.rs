@@ -21,7 +21,7 @@ pub enum AppEvent {
     AllBoards(Result<Vec<Board>, String>),
     Log(String),
     JobDone(Result<bool, String>),
-    Serial(String),
+    Serial(u64, String),
     SerialDone(u64, Result<(), String>),
     Defaults(Attached),
 }
@@ -66,8 +66,16 @@ pub struct Job {
     handle: JoinHandle<()>,
 }
 
-pub struct Monitor {
+pub struct Pane {
+    pub lines: Vec<String>,
+    pub scroll: usize,
+    pub baud: u32,
+    pub link: Option<Link>,
+}
+
+pub struct Link {
     pub port: String,
+    id: u64,
     input: UnboundedSender<String>,
     handle: JoinHandle<()>,
 }
@@ -97,12 +105,9 @@ pub struct App {
     pub job: Option<Job>,
     queue: VecDeque<usize>,
 
-    pub serial: Vec<String>,
-    pub serial_scroll: usize,
-    pub baud: u32,
-    pub monitor: Option<Monitor>,
+    pub panes: Vec<Pane>,
     mon_gen: u64,
-    resume_monitor: bool,
+    resume: Vec<usize>,
     pub input: Option<String>,
 
     pub quit: bool,
@@ -141,16 +146,15 @@ impl App {
             log_scroll: 0,
             job: None,
             queue: VecDeque::new(),
-            serial: vec![],
-            serial_scroll: 0,
-            baud: 9600,
-            monitor: None,
+            panes: vec![],
             mon_gen: 0,
-            resume_monitor: false,
+            resume: vec![],
             input: None,
             quit: false,
         };
-        app.load_baud();
+        for i in 0..app.boards.len() {
+            app.new_pane(i);
+        }
         app
     }
 
@@ -185,8 +189,8 @@ impl App {
                         port: d.port.map(|p| p.address),
                         sketch: Some(".".into()),
                     });
+                    self.new_pane(self.boards.len() - 1);
                     self.tab = Tab::Build;
-                    self.load_baud();
                 }
             }
             AppEvent::Log(line) => {
@@ -201,23 +205,36 @@ impl App {
             AppEvent::JobDone(r) => {
                 let Some(job) = self.job.take() else { return };
                 let secs = job.started.elapsed().as_secs_f32();
+                let ok = r.as_ref().ok().copied();
                 self.log.push(match r {
                     Ok(true) => format!("✓ {} done in {secs:.1}s", job.name),
                     Ok(false) => format!("✗ {} failed ({secs:.1}s)", job.name),
                     Err(e) => format!("✗ {}: {e}", job.name),
                 });
+                if job.name.starts_with("install") && ok == Some(true) {
+                    self.log.push("press a to pick your board".into());
+                    self.fetch_boards();
+                } else if ok == Some(false) && self.log.iter().any(|l| l.contains("platform not installed")) {
+                    self.log.push("press I to install the missing core".into());
+                }
                 self.next_upload();
             }
-            AppEvent::Serial(chunk) => self.push_serial(&chunk),
-            AppEvent::SerialDone(id, r) if id == self.mon_gen => {
-                self.monitor = None;
-                self.input = None;
-                self.serial_note(match r {
+            AppEvent::Serial(id, chunk) => {
+                if let Some(i) = self.pane_of(id) {
+                    self.panes[i].push(&chunk);
+                }
+            }
+            AppEvent::SerialDone(id, r) => {
+                let Some(i) = self.pane_of(id) else { return };
+                self.panes[i].link = None;
+                if i == self.active {
+                    self.input = None;
+                }
+                self.panes[i].note(match r {
                     Ok(()) => "── disconnected ──".into(),
                     Err(e) => format!("── disconnected: {e} ──"),
                 });
             }
-            AppEvent::SerialDone(..) => {}
         }
     }
 
@@ -240,6 +257,14 @@ impl App {
         (0..self.ports.len()).filter(|j| !links.contains(&Some(*j))).collect()
     }
 
+    pub fn no_boards(&self) -> String {
+        match self.ports.len() {
+            0 => "no boards in project — plug one in, or press a to add one".into(),
+            1 => "1 board plugged in but not in project — press 3, then enter to add it".into(),
+            n => format!("{n} boards plugged in but not in project — press 3, then enter to add them"),
+        }
+    }
+
     pub fn on_port_row(&self) -> bool {
         self.tab == Tab::Project && self.sel >= self.boards.len()
     }
@@ -253,7 +278,16 @@ impl App {
         let Some(p) = &self.picker else { return vec![] };
         let items: Vec<(String, String)> = match p.kind {
             Pick::AddBoard | Pick::Board => match &self.all_boards {
-                Some(Ok(all)) => all.iter().map(|b| (b.name.clone(), b.fqbn.clone())).collect(),
+                Some(Ok(all)) => {
+                    let mut v: Vec<&Board> = all.iter().collect();
+                    v.sort_by_key(|b| b.fqbn.is_empty());
+                    v.into_iter()
+                        .map(|b| match b.fqbn.as_str() {
+                            "" => (b.name.clone(), format!("install {}", b.core)),
+                            f => (b.name.clone(), f.into()),
+                        })
+                        .collect()
+                }
                 _ => vec![],
             },
             Pick::Sketch => {
@@ -314,6 +348,11 @@ impl App {
             KeyCode::Char('c') => self.compile(),
             KeyCode::Char('u') => self.upload(),
             KeyCode::Char('F') => self.flash_all(),
+            KeyCode::Char('I') => {
+                if let Some(core) = self.target().map(|t| t.fqbn.splitn(3, ':').take(2).collect::<Vec<_>>().join(":")) {
+                    self.install_core(core);
+                }
+            }
             KeyCode::Char('m') => self.toggle_monitor(),
             KeyCode::Esc if self.job.is_some() => self.cancel(),
             _ => match self.tab {
@@ -341,14 +380,13 @@ impl App {
                     self.add_from_port(j);
                 }
             }
-            KeyCode::Enter => {
-                if self.sel != self.active {
-                    self.stop_monitor();
-                }
-                self.active = self.sel;
-                self.load_baud();
-            }
+            KeyCode::Enter => self.focus(self.sel),
             KeyCode::Char('d') if self.sel < self.boards.len() => {
+                self.stop_monitor(self.sel);
+                self.panes.remove(self.sel);
+                let sel = self.sel;
+                self.resume.retain(|&r| r != sel);
+                self.resume.iter_mut().filter(|r| **r > sel).for_each(|r| *r -= 1);
                 self.boards.remove(self.sel);
                 if self.active > self.sel || self.active >= self.boards.len() {
                     self.active = self.active.saturating_sub(1);
@@ -361,15 +399,18 @@ impl App {
     }
 
     fn monitor_key(&mut self, k: KeyEvent) {
+        let Some(p) = self.panes.get_mut(self.active) else { return };
         match k.code {
-            KeyCode::Char('i') | KeyCode::Enter if self.monitor.is_some() => self.input = Some(String::new()),
+            KeyCode::Char('i') | KeyCode::Enter if p.link.is_some() => self.input = Some(String::new()),
             KeyCode::Char('+') | KeyCode::Char('=') => self.step_baud(1),
             KeyCode::Char('-') => self.step_baud(-1),
+            KeyCode::Left | KeyCode::Char('h') => self.cycle_pane(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.cycle_pane(1),
             KeyCode::Char('x') => {
-                self.serial.clear();
-                self.serial_scroll = 0;
+                p.lines.clear();
+                p.scroll = 0;
             }
-            code => scroll(&mut self.serial_scroll, self.serial.len(), code),
+            code => scroll(&mut p.scroll, p.lines.len(), code),
         }
     }
 
@@ -382,9 +423,12 @@ impl App {
             }
             KeyCode::Char(c) => buf.push(c),
             KeyCode::Enter => {
-                let line = std::mem::take(buf) + "\n";
-                if let Some(m) = &self.monitor {
-                    let _ = m.input.send(line);
+                let line = std::mem::take(buf);
+                if let Some(p) = self.panes.get_mut(self.active)
+                    && let Some(l) = &p.link
+                {
+                    let _ = l.input.send(line.clone() + "\n");
+                    p.note(format!("→ {line}"));
                 }
             }
             _ => {}
@@ -431,6 +475,10 @@ impl App {
     }
 
     fn apply(&mut self, kind: Pick, i: usize, label: String, detail: String) {
+        if let Some(core) = detail.strip_prefix("install ") {
+            self.pending_port = None;
+            return self.install_core(core.into());
+        }
         match kind {
             Pick::AddBoard => {
                 let port = self.pending_port.take();
@@ -470,6 +518,7 @@ impl App {
             self.sketches.iter().filter(|s| self.sketch_fqbn.get(*s) == Some(&fqbn)).cloned().collect();
         self.boards.push(Target { name, fqbn, port, sketch: None });
         let i = self.boards.len() - 1;
+        self.new_pane(i);
         self.sel = i;
         self.tab = Tab::Project;
         if i == 0 {
@@ -491,9 +540,7 @@ impl App {
             t.port = dir.and_then(|d| sketch::yaml_value(&d, "default_port"));
         }
         t.sketch = Some(rel);
-        if i == self.active {
-            self.load_baud();
-        }
+        self.load_baud(i);
         self.save(Some(i));
     }
 
@@ -517,7 +564,7 @@ impl App {
         let Some(dir) = sketch::folder(&self.root, &rel) else { return };
         self.sketch_fqbn.insert(rel, t.fqbn.clone());
         let port = self.port_of(i).map(|d| d.port.clone()).or(t.port.map(|address| Port { address, ..Default::default() }));
-        let baud = (with_baud && i == self.active).then_some(self.baud);
+        let baud = with_baud.then(|| self.panes[i].baud);
         let tx = self.tx.clone();
         tokio::spawn(async move {
             static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -535,10 +582,10 @@ impl App {
         });
     }
 
-    fn load_baud(&mut self) {
-        let dir = self.target().and_then(|t| t.sketch.as_deref()).and_then(|s| sketch::folder(&self.root, s));
-        if let Some(b) = dir.and_then(|d| sketch::load_baud(&d)) {
-            self.baud = b;
+    fn load_baud(&mut self, i: usize) {
+        let dir = self.boards.get(i).and_then(|t| t.sketch.as_deref()).and_then(|s| sketch::folder(&self.root, s));
+        if let (Some(b), Some(p)) = (dir.and_then(|d| sketch::load_baud(&d)), self.panes.get_mut(i)) {
+            p.baud = b;
         }
     }
 
@@ -546,7 +593,7 @@ impl App {
 
     fn prepared(&mut self, i: usize) -> Option<(String, PathBuf, String)> {
         let Some(t) = self.boards.get(i) else {
-            self.log.push("✗ no boards yet — press a to add one".into());
+            self.log.push(format!("✗ {}", self.no_boards()));
             return None;
         };
         let Some(rel) = t.sketch.clone() else {
@@ -574,6 +621,24 @@ impl App {
         self.run_job(format!("compile {name}"), vec!["compile".into(), "-b".into(), fqbn.into(), dir.into()]);
     }
 
+    fn install_core(&mut self, core: String) {
+        self.tab = Tab::Build;
+        if self.job.is_some() {
+            return;
+        }
+        self.log.clear();
+        self.log_scroll = 0;
+        self.run_job(format!("install {core}"), vec!["core".into(), "install".into(), core.into()]);
+    }
+
+    pub fn fetch_boards(&self) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = cli::board_search().await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::AllBoards(r));
+        });
+    }
+
     fn upload(&mut self) {
         self.start_uploads(vec![self.active]);
     }
@@ -596,8 +661,9 @@ impl App {
         self.log.clear();
         self.log_scroll = 0;
         // dont touch, port stays busy otherwise
-        self.resume_monitor |= self.monitor.is_some();
-        self.stop_monitor();
+        // IMPORTANT NOTE: pauses every pane, not just the ones being flashed
+        self.resume.extend((0..self.panes.len()).filter(|&i| self.panes[i].link.is_some()));
+        self.stop_monitors();
         self.queue = which.into();
         self.next_upload();
     }
@@ -617,8 +683,8 @@ impl App {
             args.push(dir.into());
             return self.run_job(format!("upload {name}"), args);
         }
-        if std::mem::take(&mut self.resume_monitor) {
-            self.start_monitor();
+        for i in std::mem::take(&mut self.resume) {
+            self.start_monitor(i);
         }
     }
 
@@ -646,75 +712,124 @@ impl App {
 
     fn toggle_monitor(&mut self) {
         self.tab = Tab::Monitor;
-        if self.monitor.is_some() {
-            self.stop_monitor();
+        if self.panes.iter().any(|p| p.link.is_some()) {
+            return self.stop_monitors();
+        }
+        let connected: Vec<usize> = (0..self.boards.len()).filter(|&i| self.port_of(i).is_some()).collect();
+        if connected.is_empty() {
+            if let Some(p) = self.panes.get_mut(self.active) {
+                p.note("── no connected boards ──".into());
+            }
         } else if !self.queue.is_empty() || self.job.as_ref().is_some_and(|j| j.name.starts_with("upload")) {
-            self.resume_monitor = true;
+            self.resume = connected;
         } else {
-            self.start_monitor();
+            connected.into_iter().for_each(|i| self.start_monitor(i));
         }
     }
 
-    fn start_monitor(&mut self) {
-        let Some(port) = self.port_of(self.active).map(|d| d.port.clone()) else {
-            return self.serial_note("── active board isn't connected ──".into());
+    fn start_monitor(&mut self, i: usize) {
+        if self.panes.get(i).is_none_or(|p| p.link.is_some()) {
+            return;
+        }
+        let Some(port) = self.port_of(i).map(|d| d.port.clone()) else {
+            return self.panes[i].note("── not connected ──".into());
         };
         self.mon_gen += 1;
-        let (id, baud, tx) = (self.mon_gen, self.baud, self.tx.clone());
+        let (id, baud, tx) = (self.mon_gen, self.panes[i].baud, self.tx.clone());
         let (input, rx) = mpsc::unbounded_channel();
-        self.serial_note(format!("── {} @ {baud} ──", port.address));
+        self.panes[i].note(format!("── {} @ {baud} ──", port.address));
         let address = port.address.clone();
         let handle = tokio::spawn(async move {
-            let r = cli::monitor(port, baud, rx, tx.clone()).await.map_err(|e| format!("{e:#}"));
+            let r = cli::monitor(id, port, baud, rx, tx.clone()).await.map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::SerialDone(id, r));
         });
-        self.monitor = Some(Monitor { port: address, input, handle });
+        self.panes[i].link = Some(Link { port: address, id, input, handle });
     }
 
-    fn stop_monitor(&mut self) {
-        if let Some(m) = self.monitor.take() {
-            m.handle.abort();
+    fn stop_monitor(&mut self, i: usize) {
+        let Some(l) = self.panes.get_mut(i).and_then(|p| p.link.take()) else { return };
+        l.handle.abort();
+        if i == self.active {
             self.input = None;
-            self.serial_note("── closed ──".into());
         }
+        self.panes[i].note("── closed ──".into());
+    }
+
+    fn stop_monitors(&mut self) {
+        (0..self.panes.len()).for_each(|i| self.stop_monitor(i));
+    }
+
+    fn new_pane(&mut self, i: usize) {
+        self.panes.insert(i, Pane { lines: vec![], scroll: 0, baud: 9600, link: None });
+        self.load_baud(i);
+    }
+
+    fn pane_of(&self, id: u64) -> Option<usize> {
+        self.panes.iter().position(|p| p.link.as_ref().is_some_and(|l| l.id == id))
+    }
+
+    pub fn shown_panes(&self) -> Vec<usize> {
+        (0..self.panes.len()).filter(|&i| i == self.active || self.panes[i].link.is_some()).collect()
+    }
+
+    fn focus(&mut self, i: usize) {
+        if i != self.active {
+            self.input = None;
+        }
+        self.active = i;
+    }
+
+    fn cycle_pane(&mut self, by: isize) {
+        let mut shown = self.shown_panes();
+        if shown.len() <= 1 {
+            shown = (0..self.panes.len()).collect();
+        }
+        let Some(at) = shown.iter().position(|&i| i == self.active) else { return };
+        let n = shown.len() as isize;
+        self.focus(shown[((at as isize + by).rem_euclid(n)) as usize]);
     }
 
     fn step_baud(&mut self, by: isize) {
-        let i = BAUDS.iter().position(|b| *b == self.baud).unwrap_or(4) as isize;
-        self.baud = BAUDS[(i + by).clamp(0, BAUDS.len() as isize - 1) as usize];
-        self.save_with(Some(self.active), true);
-        if self.monitor.is_some() {
-            self.stop_monitor();
-            self.start_monitor();
+        let i = self.active;
+        let Some(p) = self.panes.get_mut(i) else { return };
+        let at = BAUDS.iter().position(|b| *b == p.baud).unwrap_or(4) as isize;
+        p.baud = BAUDS[(at + by).clamp(0, BAUDS.len() as isize - 1) as usize];
+        let open = p.link.is_some();
+        self.save_with(Some(i), true);
+        if open {
+            self.stop_monitor(i);
+            self.start_monitor(i);
         }
     }
+}
 
-    fn push_serial(&mut self, chunk: &str) {
-        if self.serial.is_empty() {
-            self.serial.push(String::new());
+impl Pane {
+    fn push(&mut self, chunk: &str) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
         }
         for c in chunk.chars() {
             match c {
                 '\n' => {
-                    self.serial.push(String::new());
-                    if self.serial_scroll > 0 {
-                        self.serial_scroll += 1;
+                    self.lines.push(String::new());
+                    if self.scroll > 0 {
+                        self.scroll += 1;
                     }
                 }
                 '\r' => {}
-                c => self.serial.last_mut().expect("non-empty").push(c),
+                c => self.lines.last_mut().expect("non-empty").push(c),
             }
         }
-        if self.serial.len() > SERIAL_CAP {
-            self.serial.drain(..self.serial.len() - SERIAL_CAP);
+        if self.lines.len() > SERIAL_CAP {
+            self.lines.drain(..self.lines.len() - SERIAL_CAP);
         }
     }
 
-    fn serial_note(&mut self, note: String) {
-        if self.serial.last().is_some_and(|l| !l.is_empty()) {
-            self.push_serial("\n");
+    fn note(&mut self, note: String) {
+        if self.lines.last().is_some_and(|l| !l.is_empty()) {
+            self.push("\n");
         }
-        self.push_serial(&(note + "\n"));
+        self.push(&(note + "\n"));
     }
 }
 
@@ -738,14 +853,51 @@ mod tests {
 
     #[test]
     fn serial_chunks_join_into_lines() {
+        let mut p = Pane { lines: vec![], scroll: 0, baud: 9600, link: None };
+        for chunk in ["tem", "p: 21\r\nhum", "id: 40\r\n", "no newline"] {
+            p.push(chunk);
+        }
+        assert_eq!(p.lines, ["temp: 21", "humid: 40", "no newline"]);
+        p.note("── closed ──".into());
+        assert_eq!(p.lines[3..], ["── closed ──", ""]);
+    }
+
+    #[tokio::test]
+    async fn each_board_gets_its_own_pane() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(String::new(), std::env::temp_dir().join("fluxus-none"), tx);
-        for chunk in ["tem", "p: 21\r\nhum", "id: 40\r\n", "no newline"] {
-            app.push_serial(chunk);
+        let port = |a: &str| Port { address: a.into(), ..Default::default() };
+        app.event(AppEvent::Ports(Ok(vec![
+            Detected { port: port("/dev/a"), matching_boards: vec![] },
+            Detected { port: port("/dev/b"), matching_boards: vec![] },
+        ])));
+        for a in ["/dev/a", "/dev/b", "/dev/gone"] {
+            app.boards.push(Target { name: a.into(), fqbn: "x:y:z".into(), port: Some(a.into()), sketch: None });
+            app.new_pane(app.boards.len() - 1);
         }
-        assert_eq!(app.serial, ["temp: 21", "humid: 40", "no newline"]);
-        app.serial_note("── closed ──".into());
-        assert_eq!(app.serial[3..], ["── closed ──", ""]);
+        app.toggle_monitor();
+        let ids: Vec<Option<u64>> = app.panes.iter().map(|p| p.link.as_ref().map(|l| l.id)).collect();
+        assert_eq!(ids, [Some(1), Some(2), None]);
+        assert_eq!(app.shown_panes(), [0, 1]);
+
+        app.event(AppEvent::Serial(2, "rx on b\n".into()));
+        app.event(AppEvent::Serial(99, "stale\n".into()));
+        assert!(app.panes[1].lines.contains(&"rx on b".to_string()));
+        assert!(!app.panes.iter().any(|p| p.lines.contains(&"stale".to_string())));
+
+        app.cycle_pane(1);
+        assert_eq!(app.active, 1);
+        app.cycle_pane(1);
+        assert_eq!(app.active, 0);
+        app.event(AppEvent::SerialDone(1, Ok(())));
+        assert!(app.panes[0].link.is_none() && app.panes[1].link.is_some());
+
+        app.toggle_monitor();
+        assert!(app.panes.iter().all(|p| p.link.is_none()));
+        app.cycle_pane(1);
+        assert_eq!(app.active, 1);
+        app.cycle_pane(1);
+        assert_eq!(app.active, 2);
     }
 
     #[tokio::test]
@@ -760,7 +912,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(String::new(), root.clone(), tx);
         let port = |a: &str| Port { address: a.into(), ..Default::default() };
-        let giga = Board { name: "Arduino Giga R1".into(), fqbn: "arduino:mbed_giga:giga".into() };
+        let giga = Board { name: "Arduino Giga R1".into(), fqbn: "arduino:mbed_giga:giga".into(), core: String::new() };
         app.event(AppEvent::Ports(Ok(vec![
             Detected { port: port("/dev/cu.usbmodem1101"), matching_boards: vec![giga] },
             Detected { port: port("/dev/cu.usbserial-110"), matching_boards: vec![] },

@@ -80,7 +80,7 @@ mod tests {
     fn detected(addr: &str, fqbn: Option<&str>) -> Detected {
         Detected {
             port: Port { address: addr.into(), ..Default::default() },
-            matching_boards: fqbn.map(|f| Board { name: f.into(), fqbn: f.into() }).into_iter().collect(),
+            matching_boards: fqbn.map(|f| Board { name: f.into(), fqbn: f.into(), core: String::new() }).into_iter().collect(),
         }
     }
 

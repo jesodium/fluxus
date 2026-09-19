@@ -25,7 +25,7 @@ pub fn render(f: &mut Frame, app: &App) {
     header(f, app, head);
     tab_bar(f, app, tabs);
     match app.tab {
-        Tab::Build if app.monitor.is_some() => {
+        Tab::Build if app.panes.iter().any(|p| p.link.is_some()) => {
             let [top, bottom] =
                 Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
             build(f, app, top);
@@ -48,7 +48,7 @@ fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
 fn header(f: &mut Frame, app: &App, area: Rect) {
     let dim = |t: &'static str| t.fg(DIM);
     let line = match app.target() {
-        None => Line::from(vec![dim(" no boards yet — plug one in and add it from Project (3)")]),
+        None => Line::from(format!(" {}", app.no_boards()).fg(DIM)),
         Some(t) => {
             let port = match (app.port_of(app.active), &t.port) {
                 (Some(d), _) => Span::styled(format!("● {}", d.port.address), Style::new().fg(GOOD)),
@@ -110,6 +110,7 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             ],
             Tab::Monitor => &[
                 ("m", "open/close"),
+                ("←→", "pane"),
                 ("i", "send"),
                 ("+/-", "baud"),
                 ("x", "clear"),
@@ -190,34 +191,61 @@ fn build(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn serial(f: &mut Frame, app: &App, area: Rect) {
-    let title = match &app.monitor {
-        Some(m) => Line::from(vec![" monitor ".into(), format!("{} @ {} ", m.port, app.baud).fg(GOOD)]),
-        None => Line::from(vec![" monitor ".into(), format!("closed @ {} ", app.baud).fg(DIM)]),
-    };
-    let block = panel(title);
-    let [out, input] = if app.input.is_some() {
+    let [grid, input] = if app.input.is_some() {
         Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area)
     } else {
         [area, Rect::default()]
     };
 
-    if app.serial.iter().all(|l| l.is_empty()) {
-        let hint = Span::styled("press m to open the serial monitor", Style::new().fg(DIM));
-        f.render_widget(Paragraph::new(hint).block(block), out);
-    } else {
-        let lines = app
-            .serial
-            .iter()
-            .map(|l| if l.starts_with('─') { Line::styled(l.as_str(), Style::new().fg(DIM)) } else { Line::raw(l.as_str()) })
-            .collect();
-        scrollback(f, out, block, lines, app.serial_scroll);
+    let shown = app.shown_panes();
+    if shown.is_empty() {
+        let hint = Span::styled("add a board in Project (3), then press m", Style::new().fg(DIM));
+        f.render_widget(Paragraph::new(hint).block(panel(" monitor ")), grid);
+    }
+    let cols = if shown.len() <= 3 { shown.len() } else { (shown.len() as f64).sqrt().ceil() as usize };
+    let rows: Vec<&[usize]> = shown.chunks(cols.max(1)).collect();
+    let row_areas = Layout::vertical(vec![Constraint::Fill(1); rows.len()]).split(grid);
+    for (row, &row_area) in rows.iter().zip(row_areas.iter()) {
+        let cells = Layout::horizontal(vec![Constraint::Fill(1); row.len()]).split(row_area);
+        for (&i, &cell) in row.iter().zip(cells.iter()) {
+            pane(f, app, i, cell, shown.len() > 1);
+        }
     }
 
     if let Some(buf) = &app.input {
-        let block = Block::bordered().border_style(Style::new().fg(ACCENT)).title(" send ");
+        let who = app.target().map_or(String::new(), |t| format!(" to {}", t.name));
+        let block = Block::bordered().border_style(Style::new().fg(ACCENT)).title(format!(" send{who} "));
         let line = Line::from(vec![buf.clone().into(), "▏".fg(ACCENT)]);
         f.render_widget(Paragraph::new(line).block(block), input);
     }
+}
+
+fn pane(f: &mut Frame, app: &App, i: usize, area: Rect, many: bool) {
+    let p = &app.panes[i];
+    let name = app.boards.get(i).map_or("monitor", |t| t.name.as_str());
+    let status = match &p.link {
+        Some(l) => format!("{} @ {} ", l.port, p.baud).fg(GOOD),
+        None => format!("closed @ {} ", p.baud).fg(DIM),
+    };
+    let mut block = panel(Line::from(vec![format!(" {name} ").into(), status]));
+    if many && i == app.active {
+        block = block.border_style(Style::new().fg(ACCENT));
+    }
+    if p.lines.iter().all(|l| l.is_empty()) {
+        let hint = Span::styled("press m to open the serial monitor", Style::new().fg(DIM));
+        f.render_widget(Paragraph::new(hint).block(block), area);
+        return;
+    }
+    let lines = p
+        .lines
+        .iter()
+        .map(|l| match l.chars().next() {
+            Some('─') => Line::styled(l.as_str(), Style::new().fg(DIM)),
+            Some('→') => Line::styled(l.as_str(), Style::new().fg(ACCENT)),
+            _ => Line::raw(l.as_str()),
+        })
+        .collect();
+    scrollback(f, area, block, lines, p.scroll);
 }
 
 fn project(f: &mut Frame, app: &App, area: Rect) {
@@ -425,5 +453,28 @@ mod tests {
         assert_eq!(rows[1], (d(&[(1, "main")]), 2, "main.ino".into()));
         assert_eq!(rows[2], (d(&[(0, "scratchpad")]), 1, "motor_test.ino".into()));
         assert_eq!(rows[3], (vec![], 0, "blackout.ino".into()));
+    }
+
+    #[tokio::test]
+    async fn monitor_grid_fits_any_board_count() {
+        use crate::app::AppEvent;
+        use crate::cli::{Detected, Port};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        for n in 1..=5 {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(String::new(), std::env::temp_dir().join("fluxus-none"), tx);
+            let ports = (0..n).map(|j| Detected { port: Port { address: format!("/dev/p{j}"), ..Default::default() }, matching_boards: vec![] });
+            app.event(AppEvent::Ports(Ok(ports.collect())));
+            for j in 0..n {
+                app.boards.push(crate::project::Target { name: format!("board{j}"), fqbn: "x:y:z".into(), port: Some(format!("/dev/p{j}")), sketch: None });
+                app.panes.push(crate::app::Pane { lines: vec![], scroll: 0, baud: 9600, link: None });
+            }
+            app.key(KeyEvent::from(KeyCode::Char('m')));
+            assert_eq!(app.shown_panes().len(), n);
+            term.draw(|f| render(f, &app)).unwrap();
+            let screen: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+            assert!((0..n).all(|j| screen.contains(&format!("board{j}"))), "{n} panes");
+        }
     }
 }

@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88.0"
 description = "Fluxus: a user-friendly terminal UI for Arduino development over arduino-cli"
-repository = "https://github.com/jesodium/fluxus-arduino"
+repository = "https://github.com/jesodium/fluxus"
+license = "MIT"
+homepage = "https://github.com/jesodium/fluxus"
 keywords = ["arduino", "tui", "ratatui", "embedded", "cli"]
 categories = ["command-line-utilities", "embedded"]
 
@@ -29,3 +31,8 @@ libc = "0.2"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

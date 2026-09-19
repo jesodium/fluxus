@@ -52,10 +52,7 @@ async fn main() -> Result<()> {
             }
         });
     }
-    tokio::spawn(async move {
-        let r = cli::board_listall().await.map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::AllBoards(r));
-    });
+    app.fetch_boards();
 
     // -- ui --
 
