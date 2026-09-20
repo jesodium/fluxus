@@ -6,7 +6,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -184,8 +184,9 @@ pub async fn stream<S: AsRef<OsStr>>(
 ) -> Result<bool> {
     let (mut child, mut group) = spawn(args)?;
     drop(child.stdin.take());
-    let out = lines(child.stdout.take().expect("piped"), tx.clone(), AppEvent::Log);
-    let err = lines(child.stderr.take().expect("piped"), tx.clone(), AppEvent::Log);
+    let log = |l, redraw| if redraw { AppEvent::Progress(l) } else { AppEvent::Log(l) };
+    let out = lines(child.stdout.take().expect("piped"), tx.clone(), log);
+    let err = lines(child.stderr.take().expect("piped"), tx.clone(), log);
     let _ = tokio::join!(out, err);
     let status = child.wait().await?;
     group.0 = None;
@@ -195,16 +196,39 @@ pub async fn stream<S: AsRef<OsStr>>(
 fn lines(
     r: impl AsyncRead + Unpin + Send + 'static,
     tx: UnboundedSender<AppEvent>,
-    wrap: impl Fn(String) -> AppEvent + Send + 'static,
+    wrap: impl Fn(String, bool) -> AppEvent + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut r = BufReader::new(r);
         let mut buf = Vec::new();
-        while r.read_until(b'\n', &mut buf).await.is_ok_and(|n| n > 0) {
-            let _ = tx.send(wrap(String::from_utf8_lossy(&buf).trim_end().to_string()));
+        while let Ok(Some(redraw)) = chunk(&mut r, &mut buf).await {
+            let _ = tx.send(wrap(String::from_utf8_lossy(&buf).trim_end().to_string(), redraw));
             buf.clear();
         }
     })
+}
+
+// stops on \r as well as \n: avrdude redraws its progress bar in place
+async fn chunk<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    loop {
+        let avail = r.fill_buf().await?;
+        if avail.is_empty() {
+            return Ok((!buf.is_empty()).then_some(false));
+        }
+        match avail.iter().position(|b| matches!(b, b'\n' | b'\r')) {
+            Some(i) => {
+                let redraw = avail[i] == b'\r';
+                buf.extend_from_slice(&avail[..i]);
+                r.consume(i + 1);
+                return Ok(Some(redraw));
+            }
+            None => {
+                let n = avail.len();
+                buf.extend_from_slice(avail);
+                r.consume(n);
+            }
+        }
+    }
 }
 
 // -- serial monitor --
@@ -224,7 +248,7 @@ pub async fn monitor(
     let (mut child, mut group) = spawn(args)?;
     let mut stdin = child.stdin.take().expect("piped");
     let mut out = child.stdout.take().expect("piped");
-    lines(child.stderr.take().expect("piped"), tx.clone(), move |l| AppEvent::Serial(id, l + "\n"));
+    lines(child.stderr.take().expect("piped"), tx.clone(), move |l, _| AppEvent::Serial(id, l + "\n"));
 
     // for Serial.print without newline
     let mut buf = [0u8; 4096];

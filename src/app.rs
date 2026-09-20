@@ -21,6 +21,7 @@ pub enum AppEvent {
     Ports(Result<Vec<Detected>, String>),
     AllBoards(Result<Vec<Board>, String>),
     Log(String),
+    Progress(String),
     JobDone(Result<bool, String>),
     Serial(u64, String),
     SerialDone(u64, Result<(), String>),
@@ -105,6 +106,7 @@ pub struct App {
 
     pub log: Vec<String>,
     pub log_scroll: usize,
+    redrawing: bool,
     pub job: Option<Job>,
     queue: VecDeque<usize>,
 
@@ -150,6 +152,7 @@ impl App {
             picker: None,
             log: vec![],
             log_scroll: 0,
+            redrawing: false,
             job: None,
             queue: VecDeque::new(),
             panes: vec![],
@@ -179,6 +182,7 @@ impl App {
                 self.ports = p;
                 self.ports_err = None;
                 self.scanned = true;
+                self.resume_ready();
             }
             AppEvent::Ports(Err(e)) => self.ports_err = Some(e),
             AppEvent::AllBoards(r) => {
@@ -205,13 +209,27 @@ impl App {
                 let line = line
                     .replace(&format!("{}/", self.root.display()), "")
                     .replace(&format!("{}/", sketch::scratch().display()), "");
+                // the last redraw of a progress bar is the one worth keeping
+                if self.redrawing && !line.is_empty() {
+                    self.log.pop();
+                }
+                self.redrawing = false;
                 self.log.push(line);
                 if self.log_scroll > 0 {
                     self.log_scroll += 1;
                 }
             }
+            AppEvent::Progress(line) => {
+                if std::mem::replace(&mut self.redrawing, true) {
+                    self.log.pop();
+                } else if self.log_scroll > 0 {
+                    self.log_scroll += 1;
+                }
+                self.log.push(line);
+            }
             AppEvent::JobDone(r) => {
                 let Some(job) = self.job.take() else { return };
+                self.redrawing = false;
                 let secs = job.started.elapsed().as_secs_f32();
                 let ok = r.as_ref().ok().copied();
                 self.log.push(match r {
@@ -720,12 +738,23 @@ impl App {
             args.push(dir.into());
             return self.run_job(format!("upload {name}"), args);
         }
+    }
+
+    // a flashed board reboots, so wait for its port to come back before reopening
+    fn resume_ready(&mut self) {
+        if self.job.is_some() || !self.queue.is_empty() {
+            return;
+        }
         for i in std::mem::take(&mut self.resume) {
-            self.start_monitor(i);
+            match self.port_of(i).is_some() {
+                true => self.start_monitor(i),
+                false => self.resume.push(i),
+            }
         }
     }
 
     fn run_job(&mut self, name: String, args: Vec<OsString>) {
+        self.redrawing = false;
         let shown: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
         self.event(AppEvent::Log(format!("$ arduino-cli {}", shown.join(" "))));
         let tx = self.tx.clone();
@@ -749,7 +778,8 @@ impl App {
 
     fn toggle_monitor(&mut self) {
         self.tab = Tab::Monitor;
-        if self.panes.iter().any(|p| p.link.is_some()) {
+        if self.panes.iter().any(|p| p.link.is_some()) || !self.resume.is_empty() {
+            self.resume.clear();
             return self.stop_monitors();
         }
         let connected: Vec<usize> = (0..self.boards.len()).filter(|&i| self.port_of(i).is_some()).collect();
@@ -853,7 +883,8 @@ impl Pane {
                         self.scroll += 1;
                     }
                 }
-                '\r' => {}
+                // junk from a board that is still rebooting would scramble the pane
+                c if c.is_control() => {}
                 c => self.lines.last_mut().expect("non-empty").push(c),
             }
         }
@@ -897,6 +928,29 @@ mod tests {
         assert_eq!(p.lines, ["temp: 21", "humid: 40", "no newline"]);
         p.note("── closed ──".into());
         assert_eq!(p.lines[3..], ["── closed ──", ""]);
+    }
+
+    #[tokio::test]
+    async fn progress_redraws_in_place_and_resume_waits_for_the_port() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(String::new(), std::env::temp_dir().join("fluxus-none"), tx);
+        app.event(AppEvent::Log("$ arduino-cli compile -u".into()));
+        for pct in [10, 55, 100] {
+            app.event(AppEvent::Progress(format!("Writing | ## | {pct}%")));
+        }
+        app.event(AppEvent::Log(String::new()));
+        app.event(AppEvent::Log("Done".into()));
+        assert_eq!(app.log, ["$ arduino-cli compile -u", "Writing | ## | 100%", "", "Done"]);
+
+        app.boards.push(Target { name: "uno".into(), fqbn: "x:y:z".into(), port: Some("/dev/uno".into()), sketch: None });
+        app.new_pane(0);
+        app.resume = vec![0];
+        app.event(AppEvent::Ports(Ok(vec![])));
+        assert!(app.panes[0].link.is_none(), "port still gone");
+        let back = Detected { port: Port { address: "/dev/uno".into(), ..Default::default() }, matching_boards: vec![] };
+        app.event(AppEvent::Ports(Ok(vec![back])));
+        assert!(app.panes[0].link.is_some(), "port back");
+        assert!(app.resume.is_empty());
     }
 
     #[tokio::test]

@@ -233,6 +233,27 @@ fn scrollback(f: &mut Frame, area: Rect, block: Block, lines: Vec<Line>, scroll:
     f.render_widget(para.block(block).scroll((top.min(u16::MAX as usize) as u16, 0)), area);
 }
 
+// avrdude and arduino-cli redraw these in place: "Writing | ##### | 45% 0.02s"
+fn bar(line: &str, width: u16) -> Option<Line<'static>> {
+    let (label, rest) = line.split_once('|')?;
+    let (hashes, tail) = rest.rsplit_once('|')?;
+    if !hashes.trim().chars().all(|c| c == '#') {
+        return None;
+    }
+    let tail = tail.trim();
+    let pct: usize = tail.split('%').next()?.trim().parse().ok()?;
+    let label = label.trim();
+    let room = (width as usize).saturating_sub(label.chars().count() + tail.chars().count() + 4);
+    let cells = room.clamp(8, 48);
+    let done = cells * pct.min(100) / 100;
+    Some(Line::from(vec![
+        format!(" {label} ").fg(th().gold),
+        "█".repeat(done).fg(th().accent),
+        "░".repeat(cells - done).fg(th().panel),
+        format!(" {tail}").fg(th().dim),
+    ]))
+}
+
 fn build(f: &mut Frame, app: &App, area: Rect) {
     let title = match &app.job {
         Some(j) => Line::from(format!(" build — {}… ", j.name).fg(th().gold)),
@@ -244,7 +265,9 @@ fn build(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(hint).block(block), area);
         return;
     }
-    let lines = app.log.iter().map(|l| Line::styled(l.as_str(), log_style(l))).collect();
+    let width = block.inner(area).width;
+    let lines =
+        app.log.iter().map(|l| bar(l, width).unwrap_or_else(|| Line::styled(l.as_str(), log_style(l)))).collect();
     scrollback(f, area, block, lines, app.log_scroll);
 }
 
@@ -535,6 +558,15 @@ mod tests {
         assert_eq!(rows[1], (d(&[(1, "main")]), 2, "main.ino".into()));
         assert_eq!(rows[2], (d(&[(0, "scratchpad")]), 1, "motor_test.ino".into()));
         assert_eq!(rows[3], (vec![], 0, "blackout.ino".into()));
+    }
+
+    #[test]
+    fn progress_lines_become_a_bar() {
+        let line = bar("Writing | ##################       | 65% 0.02s", 80).unwrap();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!(" Writing {}{} 65% 0.02s", "█".repeat(31), "░".repeat(17)));
+        assert!(bar("Sketch uses 2306 bytes | 7% of program storage", 80).is_none());
+        assert!(bar("$ arduino-cli compile -u", 80).is_none());
     }
 
     #[tokio::test]
